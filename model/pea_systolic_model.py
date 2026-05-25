@@ -43,10 +43,11 @@ class PEASystolicModel:
             # 1. Vector Adder (Bias Addition)
             val = psum_array[i] + self.biases[i]
             
-            # 2. Arithmetic Right Shift Quantization
-            val = val >> self.reg_right_shift
+            # 2. Arithmetic Right Shift Quantization with Rounding
+            if self.reg_right_shift > 0:
+                val = (val + (1 << (self.reg_right_shift - 1))) >> self.reg_right_shift
             
-            # 3. ReLU Activation & Saturation to INT8 (0-127)
+            # 3. ReLU Activation & Saturation to signed INT8 max (127)
             if val < 0:
                 val = 0
             elif val > 127:
