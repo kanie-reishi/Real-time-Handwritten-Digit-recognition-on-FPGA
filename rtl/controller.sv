@@ -74,6 +74,7 @@ module controller_v2 #(
         ST_FETCH,
         ST_DECODE,
         ST_EXEC_DMA,
+        ST_WAIT_DMA_ACK,
         ST_WAIT_MAC,
         ST_WAIT_POOL,
         ST_WAIT_SYNC,
@@ -129,11 +130,16 @@ module controller_v2 #(
 
             ST_EXEC_DMA: begin
                 // [GIẢNG BÀI] 3. Hardware Interlock: Ngăn rơi lệnh DMA.
-                // Thay vì vội vã chuyển sang ST_FETCH chỉ sau 1 clock, máy trạng thái sẽ ĐỨNG YÊN (stall) ở đây
-                // nếu dma_busy_i đang là 1. Chỉ khi DMA hoàn toàn rảnh rỗi (!dma_busy_i), 
-                // Controller mới tự động đi tiếp để lấy lệnh mới. 
+                // Chờ cho đến khi DMA hoàn toàn rảnh rỗi (!dma_busy_i) để xuất lệnh DMA mới.
+                // Khi DMA đã sẵn sàng, nhảy sang ST_WAIT_DMA_ACK để chờ DMA bắt đầu.
                 // Software C không cần lo chèn lệnh SYNC thủ công nữa!
-                if (!dma_busy_i) next_state = ST_FETCH;
+                if (!dma_busy_i) next_state = ST_WAIT_DMA_ACK;
+            end
+
+            ST_WAIT_DMA_ACK: begin
+                // Đợi cho đến khi DMA chính thức chạy (dma_busy_i bật lên 1).
+                // Sau đó nhảy sang ST_WAIT_SYNC để chặn pipeline cho đến khi DMA hoàn thành.
+                if (dma_busy_i) next_state = ST_WAIT_SYNC;
             end
 
             ST_WAIT_MAC: begin
@@ -190,7 +196,7 @@ module controller_v2 #(
                     case (opcode)
                         OP_SET_ADDR: begin
                             logic [1:0] addr_type;
-                            addr_type = curr_inst[41:40];
+                            addr_type = curr_inst[59:58];
                             if      (addr_type == 2'b00) reg_ifm_addr <= curr_inst[39:0];
                             else if (addr_type == 2'b01) reg_wgt_addr <= curr_inst[39:0];
                             else if (addr_type == 2'b10) reg_ofm_addr <= curr_inst[39:0];
@@ -242,14 +248,12 @@ module controller_v2 #(
                             dma_bank_sel_o <= BANK_WGT;
                         end 
                         else if (opcode == OP_LOAD_IFM) begin
-                            // [GIẢNG BÀI] 4. Auto-Routing Ping-Pong: 
-                            // Phần mềm không cần biết là ghi vào Ping hay Pong. Phần cứng tự nội soi
-                            // xem MAC đang trỏ vào đâu (src_bank_ptr), và tự bẻ lái DMA đổ dữ liệu 
-                            // vào Bank đối diện. Cơ chế "Che giấu độ phức tạp" này giúp code C nhàn hơn rất nhiều!
+                            // Sửa lỗi: Cần load IFM vào ĐÚNG bank hiện tại (src_bank_ptr) để lệnh RUN_MAC ngay sau đó đọc được.
+                            // Không được load vào bank đối diện vì RUN_MAC đọc từ src_bank_ptr.
                             dma_dir_o      <= 1'b0; // READ từ DDR
                             dma_addr_o     <= reg_ifm_addr; // Lấy địa chỉ của IFM
                             dma_bytes_o    <= curr_inst[31:0];
-                            dma_bank_sel_o <= (src_bank_ptr == BANK_PING) ? BANK_PONG : BANK_PING;
+                            dma_bank_sel_o <= src_bank_ptr;
                         end
                         else if (opcode == OP_STORE_OFM) begin
                             dma_dir_o      <= 1'b1; // WRITE

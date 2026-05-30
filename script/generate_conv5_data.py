@@ -1,102 +1,26 @@
 import os
+import json
 import numpy as np
+import sys
 
-# ==============================================================================
-# CONFIGURATION
-# ==============================================================================
-# Trỏ thư mục này tới nơi chứa file quantization.py của bạn nếu muốn load real data
-# Nếu thư mục không tồn tại, script sẽ tạo Mock Data để test.
-TRAINED_DATA_DIR = "./trained_data"
+# Thêm thư mục model vào path để import hw_simulation
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "model")))
+# pyrefly: ignore [missing-import]
+import hw_simulation
+
 OUT_DIR = "../tb/hex"
 
-# Testbench parameters matching a tile of computation
-# C_in is 16 (matches the 16 rows of the systolic array)
-# C_out is 16 (matches the 16 columns of the systolic array)
-# N_pixels is the number of cycles the COMPUTE state runs
-N_PIXELS = 25  # e.g., 5x5 spatial pixels
-ARRAY_SIZE = 16
-RIGHT_SHIFT = 2
-
-# ==============================================================================
-# GENERATORS
-# ==============================================================================
-def load_or_generate_data():
-    if os.path.exists(TRAINED_DATA_DIR):
-        print(f"Loading trained data from {TRAINED_DATA_DIR}...")
-        # Placeholder cho việc load file npy thực tế của bạn
-        # ifm = np.load(os.path.join(TRAINED_DATA_DIR, "c5_ifm.npy"))
-        # weight = np.load(os.path.join(TRAINED_DATA_DIR, "c5_weight.npy"))
-        # bias = np.load(os.path.join(TRAINED_DATA_DIR, "c5_bias.npy"))
-        pass
-    
-    print("Generating Mock Data for Testbench (INT8/INT32)...")
-    # IFM: N_pixels sequence, each has 16 values (fed to the 16 rows)
-    ifm = np.random.randint(-128, 127, size=(N_PIXELS, ARRAY_SIZE), dtype=np.int8)
-    
-    # Weights: 16 rows x 16 columns
-    weight = np.random.randint(-10, 10, size=(ARRAY_SIZE, ARRAY_SIZE), dtype=np.int8)
-    
-    # Bias: 16 values
-    bias = np.random.randint(0, 50, size=(ARRAY_SIZE,), dtype=np.int32)
-    
-    return ifm, weight, bias
-
-def simulate_pea_top(ifm, weight, bias, rshift):
-    """
-    Giả lập chính xác logic tính toán của pea_top.sv (RTL):
-    - Mỗi chu kỳ, 16 giá trị IFM được nhân với 16 hàng Weight.
-    - Psum cộng dồn theo chiều dọc (16 hàng).
-    - Post-processing: + Bias, >> shift (có làm tròn), ReLU, Clamp(127).
-    """
-    n_pixels = ifm.shape[0]
-    expected_ofm = np.zeros((n_pixels, ARRAY_SIZE), dtype=np.int8)
-    
-    for p in range(n_pixels):
-        # 1. Tính Dot product qua 16 hàng cho 16 cột (Vector MAC)
-        # psum shape: (16,)
-        psum = np.zeros(ARRAY_SIZE, dtype=np.int32)
-        for c in range(ARRAY_SIZE): # Column
-            for r in range(ARRAY_SIZE): # Row
-                psum[c] += int(ifm[p, r]) * int(weight[r, c])
-                
-        # 2. Post-processing (hành vi y hệt khối Post-processing trong pea_top.sv)
-        for c in range(ARRAY_SIZE):
-            val = psum[c] + int(bias[c])
-            
-            # Arithmetic Right Shift with Rounding
-            if rshift > 0:
-                val = (val + (1 << (rshift - 1))) >> rshift
-                
-            # ReLU & Saturation
-            if val < 0:
-                val = 0
-            elif val > 127:
-                val = 127
-                
-            expected_ofm[p, c] = val
-            
-    return expected_ofm
-
-# ==============================================================================
-# HEX EXPORT (Two's Complement)
-# ==============================================================================
 def export_hex(filename, data, is_32bit=False):
     os.makedirs(OUT_DIR, exist_ok=True)
     filepath = os.path.join(OUT_DIR, filename)
     with open(filepath, 'w') as f:
         if is_32bit:
-            # Ghi INT32 -> 8 ký tự hex (big-endian)
             for val in data.flatten():
                 hex_str = f"{np.uint32(val):08X}"
                 f.write(hex_str + "\n")
         else:
-            # Ghi INT8 -> 2 ký tự hex
             if len(data.shape) > 1 and data.shape[1] == 16:
-                # Ghi 16 bytes trên 1 dòng (cho bus 128-bit)
                 for row in data:
-                    # Nối 16 bytes lại thành 1 chuỗi hex dài 32 ký tự
-                    # Note: SystemVerilog $readmemh reads left-to-right (MSB to LSB).
-                    # We will output row[15] down to row[0] so that data_in_left[0] gets row[0].
                     row_hex = "".join([f"{np.uint8(v):02X}" for v in reversed(row)])
                     f.write(row_hex + "\n")
             else:
@@ -105,30 +29,85 @@ def export_hex(filename, data, is_32bit=False):
     print(f"Exported {filepath}")
 
 def main():
-    ifm, weight, bias = load_or_generate_data()
-    expected_ofm = simulate_pea_top(ifm, weight, bias, RIGHT_SHIFT)
+    print("Loading weights from hw_simulation...")
+    original_cwd = os.getcwd()
     
-    print("\n--- Shape Info ---")
-    print(f"IFM: {ifm.shape}")
-    print(f"Weight: {weight.shape}")
-    print(f"Bias: {bias.shape}")
-    print(f"Expected OFM: {expected_ofm.shape}")
+    # Xác định thư mục model một cách an toàn dựa trên vị trí file script này
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    model_dir = os.path.abspath(os.path.join(script_dir, "..", "model"))
+    os.chdir(model_dir)
     
-    # Export to hex files for SystemVerilog $readmemh
-    # IFM exported as 128-bit words (16 bytes per line)
-    export_hex("ifm.hex", ifm, is_32bit=False)
+    weights, rs = hw_simulation.load_weights()
     
-    # Weight exported as 128-bit words (16 bytes per line). 
-    # Each row of the weight matrix is 16 columns (16 weights).
-    export_hex("weight.hex", weight, is_32bit=False)
+    # Chạy HW Simulator với một ảnh test (ảnh toàn số 1)
+    img = np.full((1, 32, 32), 1, dtype=np.uint8)
+    pred, mid = hw_simulation.hw_forward(img, weights, rs, verbose=False)
     
-    # Bias exported as 32-bit words
-    export_hex("bias.hex", bias, is_32bit=True)
+    os.chdir(original_cwd)
     
-    # Expected OFM exported as 128-bit words
-    export_hex("expected_ofm.hex", expected_ofm, is_32bit=False)
+    # -------------------------------------------------------------------------
+    # 1. IFM: Lấy từ đầu ra S4.
+    # Kích thước: [16, 5, 5] -> Hardware: Cần [25, 16] (quét y, x, rồi đến 16 channel)
+    # -------------------------------------------------------------------------
+    s4_out = mid["s4_out"] # [16, 5, 5]
+    ifm_hw = np.transpose(s4_out, (1, 2, 0)) # [5, 5, 16]
+    ifm_hw = ifm_hw.reshape(25, 16)
     
-    print("\nDone! Testbench data is ready.")
+    # -------------------------------------------------------------------------
+    # 2. Weight: Lấy từ C5.
+    # Kích thước: [120, 16, 5, 5]. Hardware chạy 8 pass (mỗi pass 16 kênh ra).
+    # -------------------------------------------------------------------------
+    c5_w = weights["c5_w"]
+    weight_hw = np.zeros((8 * 25 * 16, 16), dtype=np.int8) 
+    
+    for p in range(8):
+        c_start = p * 16
+        c_end = min((p + 1) * 16, 120)
+        c_len = c_end - c_start
+        
+        # Lấy 16 kênh ra cho pass này (Pad 0 nếu pass cuối chỉ có 8 kênh)
+        w_chunk = np.zeros((16, 16, 5, 5), dtype=np.int8)
+        w_chunk[0:c_len, :, :, :] = c5_w[c_start:c_end, :, :, :]
+        
+        # Hardware tự động Tiling theo kx, ky. FSM lặp ky trước, kx sau hay ngược lại?
+        # Trong pea_top.sv: loop_kx tăng trước, loop_ky tăng sau.
+        # Nghĩa là thứ tự tile sẽ là (0,0), (0,1), (0,2)... (4,4) (ky, kx).
+        tile_idx = 0
+        for ky in range(5):
+            for kx in range(5):
+                # Weight matrix cho Tile này: [16_out, 16_in]
+                w_tile = w_chunk[:, :, ky, kx] 
+                
+                # Hardware cần Row = Cin, Col = Cout
+                w_tile_hw = np.transpose(w_tile, (1, 0)) # [16_in, 16_out]
+                
+                row_start = p * 400 + tile_idx * 16
+                weight_hw[row_start : row_start + 16, :] = w_tile_hw
+                tile_idx += 1
+                
+    # -------------------------------------------------------------------------
+    # 3. Bias: Lấy từ C5. Pad từ 120 lên 128.
+    # -------------------------------------------------------------------------
+    c5_b = weights["c5_b"]
+    bias_hw = np.zeros(128, dtype=np.int32)
+    bias_hw[0:120] = c5_b
+    
+    # -------------------------------------------------------------------------
+    # 4. Expected OFM: Lấy đầu ra C5.
+    # Kích thước: [120]. Pad lên 128, và format thành [8, 16] (8 pass).
+    # -------------------------------------------------------------------------
+    c5_out = mid["c5_out"] # [120]
+    ofm_hw = np.zeros(128, dtype=np.int8)
+    ofm_hw[0:120] = c5_out
+    ofm_hw = ofm_hw.reshape(8, 16) 
+    
+    # Export Hex
+    export_hex("ifm.hex", ifm_hw, is_32bit=False)
+    export_hex("weight.hex", weight_hw, is_32bit=False)
+    export_hex("bias.hex", bias_hw, is_32bit=True)
+    export_hex("expected_ofm.hex", ofm_hw, is_32bit=False)
+    
+    print("\n[SUCCESS] Testbench data generated from Golden Model!")
 
 if __name__ == "__main__":
     main()

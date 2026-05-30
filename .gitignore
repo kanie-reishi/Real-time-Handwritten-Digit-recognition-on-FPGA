@@ -3,3 +3,9 @@ __pycache__/
 data/
 checkpoint/
 weights/
+tb/*.py
+tb/*.log
+tb/*.bat
+tb/*.vcd
+tb/*.txt
+tb/*.out

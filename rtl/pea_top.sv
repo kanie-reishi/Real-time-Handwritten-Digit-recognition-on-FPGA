@@ -1,10 +1,5 @@
 `timescale 1ns / 1ps
 
-// ============================================================================
-// Module: pea_top
-// Description: Top-level wrapper for the Processing Element Array.
-//              Includes the 16x16 Systolic Core, AGU/FSM, Config Regs, and Post-Processing.
-// ============================================================================
 module pea_top #(
     parameter DATA_WIDTH = 8,
     parameter PSUM_WIDTH = 32,
@@ -17,7 +12,7 @@ module pea_top #(
     input  logic start,
     output logic done,
 
-    // Configuration Interface (Memory Mapped Register File)
+    // Configuration Interface
     input  logic [7:0]  cfg_addr,
     input  logic [31:0] cfg_data,
     input  logic        cfg_we,
@@ -39,18 +34,20 @@ module pea_top #(
 );
 
     // =========================================================================
-    // 1. Configuration Register File (Layer-specific parameters)
+    // 1. Configuration Register File
     // =========================================================================
-    logic [31:0] reg_ifm_width;     // Chiều rộng của ảnh đầu vào (Input Feature Map)
-    logic [31:0] reg_ifm_height;    // Chiều cao của ảnh đầu vào
-    logic [31:0] reg_channels_in;   // Số lượng kênh đầu vào (Input Channels / Depth)
-    logic [31:0] reg_channels_out;  // Số lượng kênh đầu ra (Số lượng bộ lọc / Filters)
-    logic [31:0] reg_kernel_size;   // Kích thước cạnh của bộ lọc (ví dụ: 5 cho kernel 5x5)
-    logic [4:0]  reg_right_shift;   // Số bit dịch phải (Right Shift) dùng cho quá trình Lượng tử hóa
-    
-    // Pre-computed strides to reduce multiplier delay in critical path
-    logic [31:0] reg_row_stride;    // Bước nhảy bộ nhớ cho mỗi hàng (Bytes per row = ifm_width * channels_in)
-    logic [31:0] reg_col_stride;    // Bước nhảy bộ nhớ cho mỗi cột (Bytes per pixel = channels_in)
+    logic [31:0] reg_ifm_width;     
+    logic [31:0] reg_ifm_height;    
+    logic [31:0] reg_channels_in;   
+    logic [31:0] reg_channels_out;  
+    logic [31:0] reg_kernel_size;   
+    logic [4:0]  reg_right_shift;   
+    logic [31:0] reg_row_stride;    
+    logic [31:0] reg_col_stride;    
+    logic [31:0] reg_weight_base;   
+    logic [31:0] reg_bias_base;     
+    logic        reg_relu_en;
+    logic        reg_pool_en;
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -62,6 +59,10 @@ module pea_top #(
             reg_right_shift  <= '0;
             reg_row_stride   <= '0;
             reg_col_stride   <= '0;
+            reg_weight_base  <= '0;
+            reg_bias_base    <= '0;
+            reg_relu_en      <= 1'b0;
+            reg_pool_en      <= 1'b0;
         end else if (cfg_we) begin
             case (cfg_addr)
                 8'h00: reg_ifm_width    <= cfg_data;
@@ -72,243 +73,436 @@ module pea_top #(
                 8'h14: reg_right_shift  <= cfg_data[4:0];
                 8'h18: reg_row_stride   <= cfg_data;
                 8'h1C: reg_col_stride   <= cfg_data;
+                8'h20: reg_weight_base  <= cfg_data;
+                8'h24: reg_bias_base    <= cfg_data;
+                8'h28: reg_relu_en      <= cfg_data[0];
+                8'h2C: reg_pool_en      <= cfg_data[0];
             endcase
         end
     end
 
+    logic [31:0] out_width;
+    assign out_width = reg_ifm_width - reg_kernel_size + 1;
+
+    logic [31:0] tiles_per_cout;
+    assign tiles_per_cout = reg_channels_in * reg_kernel_size * reg_kernel_size;
+
     // =========================================================================
-    // 2. FSM & Nested Loop AGU (Address Generation Unit)
+    // 2. FSM & Control
     // =========================================================================
-    typedef enum logic [1:0] {
-        IDLE      = 2'd0,
-        PRE_LOAD  = 2'd1, // Load weights & biases
-        COMPUTE   = 2'd2, // Nested loops for im2col MACs
-        POST_PROC = 2'd3  // Wait for pipeline flush
+    typedef enum logic [2:0] {
+        IDLE            = 3'd0,
+        LOAD_BIAS       = 3'd1,
+        LOAD_LINE_BUFFER= 3'd2,
+        LOAD_WEIGHT     = 3'd3,
+        STREAM_ROW      = 3'd4,
+        WAIT_FLUSH      = 3'd5,
+        WAIT_BRAM       = 3'd6,
+        POST_PROC       = 3'd7
     } state_t;
 
     state_t state, next_state;
 
-    // Control signals for the Systolic Core
+    logic [31:0] loop_cout; 
+    logic [31:0] loop_y;    
+    logic [31:0] loop_cin;  
+    logic [31:0] loop_ky;   
+    logic [31:0] loop_kx;   
+
+    logic [7:0]  load_counter;
+    logic [31:0] stream_cnt;
+    logic [31:0] psum_flush_cnt;
+    
+    logic [31:0] lb_load_row_cnt;
+    logic [31:0] lb_load_col_cnt;
+    logic        load_full_lb;
+    logic [31:0] rows_to_load;
+    
+    assign rows_to_load = load_full_lb ? reg_kernel_size : 32'd1;
+
+    logic [31:0] tile_index;
+    assign tile_index = loop_cout * tiles_per_cout + 
+                        loop_cin * (reg_kernel_size * reg_kernel_size) + 
+                        loop_ky * reg_kernel_size + 
+                        loop_kx;
+
+    logic is_first_acc;
+    assign is_first_acc = (loop_cin == 0 && loop_ky == 0 && loop_kx == 0);
+
     logic [15:0]       load_weight_en;
-    logic [15:0][7:0]  weight_in_top;
+    logic              swap_weight_in_global;
     logic [15:0]       data_en_left;
     logic [15:0]       psum_en_top;
     logic [15:0][31:0] psum_in_top;
 
-    // Outputs from Systolic Core
     logic [15:0][31:0] psum_out_bottom;
     logic [15:0]       psum_en_bottom;
-    
-    // Bias Array
-    logic [31:0] bias_array [0:15]; 
 
-    // Nested Loops Counters for Im2Col AGU
-    logic [31:0] loop_out_x, loop_out_y, loop_cin, loop_kx, loop_ky;
-    logic        compute_done;
-    logic [7:0]  load_counter;
+    logic [31:0] bias_array [0:15]; 
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state <= IDLE;
-            loop_out_x <= '0; loop_out_y <= '0;
-            loop_cin <= '0; loop_kx <= '0; loop_ky <= '0;
-            compute_done <= 1'b0;
-            load_weight_en <= 16'd0;
-            load_counter <= '0;
+            loop_cout <= '0; loop_y <= '0; loop_cin <= '0; 
+            loop_ky <= '0; loop_kx <= '0;
+            load_counter <= '0; stream_cnt <= '0; psum_flush_cnt <= '0;
+            lb_load_row_cnt <= '0; lb_load_col_cnt <= '0;
+            load_full_lb <= 1'b1;
         end else begin
             state <= next_state;
             
-            if (state == IDLE) begin
-                loop_out_x <= '0; loop_out_y <= '0;
-                loop_cin <= '0; loop_kx <= '0; loop_ky <= '0;
-                compute_done <= 1'b0;
-                load_counter <= '0;
-                // Clear load_weight_en in IDLE
-                load_weight_en <= 16'd0; 
-                
-            end else if (state == PRE_LOAD) begin
-                load_counter <= load_counter + 1;
-                // Enable weights only during first 16 cycles of PRE_LOAD
-                if (load_counter < 16) load_weight_en <= 16'hFFFF;
-                else load_weight_en <= 16'd0;
-                
-                // Load bias into bias_array after weights
-                if (load_counter >= 16 && load_counter < 32) begin
-                    // Read lowest 32 bits (4 bytes) of the 128-bit bus as the bias value
-                    bias_array[load_counter - 16] <= {wb_read_data[3], wb_read_data[2], wb_read_data[1], wb_read_data[0]}; 
+            if (state == IDLE && start) begin
+                loop_cout <= '0; loop_y <= '0; loop_cin <= '0; 
+                loop_ky <= '0; loop_kx <= '0;
+                load_full_lb <= 1'b1;
+            end
+            
+            if (state != LOAD_LINE_BUFFER && next_state == LOAD_LINE_BUFFER) begin
+                lb_load_row_cnt <= '0;
+                lb_load_col_cnt <= '0;
+            end
+            
+            case (state)
+                LOAD_BIAS: begin
+                    // 1-cycle latency SRAM handling moved to a separate always_ff block
+                    load_counter <= load_counter + 1;
+                    if (load_counter == 15) load_counter <= '0;
                 end
                 
-            end else if (state == COMPUTE) begin
-                // Ensure weight load is off
-                load_weight_en <= 16'd0;
+                LOAD_LINE_BUFFER: begin
+                    lb_load_col_cnt <= lb_load_col_cnt + 1;
+                    if (lb_load_col_cnt == reg_ifm_width - 1) begin
+                        lb_load_col_cnt <= '0;
+                        lb_load_row_cnt <= lb_load_row_cnt + 1;
+                    end
+                end
                 
-                // Im2Col Nested Loop Execution
-                if (loop_cin < reg_channels_in - 1) begin
-                    loop_cin <= loop_cin + 1;
-                end else begin
-                    loop_cin <= '0;
-                    if (loop_kx < reg_kernel_size - 1) begin
-                        loop_kx <= loop_kx + 1;
-                    end else begin
-                        loop_kx <= '0;
-                        if (loop_ky < reg_kernel_size - 1) begin
-                            loop_ky <= loop_ky + 1;
-                        end else begin
-                            loop_ky <= '0;
-                            // Sliding window striding
-                            if (loop_out_x < reg_ifm_width - reg_kernel_size) begin
-                                loop_out_x <= loop_out_x + 1;
+                LOAD_WEIGHT: begin
+                    load_counter <= load_counter + 1;
+                    if (load_counter == 15) load_counter <= '0;
+                end
+                
+                STREAM_ROW: begin
+                    stream_cnt <= stream_cnt + 1;
+                    if (stream_cnt == out_width - 1) stream_cnt <= '0;
+                end
+                
+                WAIT_FLUSH: begin
+                    if (psum_en_bottom[0]) begin
+                        psum_flush_cnt <= psum_flush_cnt + 1;
+                        if (psum_flush_cnt == out_width - 1) begin
+                            psum_flush_cnt <= '0;
+                            if (loop_kx < reg_kernel_size - 1) begin
+                                loop_kx <= loop_kx + 1;
                             end else begin
-                                loop_out_x <= '0;
-                                if (loop_out_y < reg_ifm_height - reg_kernel_size) begin
-                                    loop_out_y <= loop_out_y + 1;
+                                loop_kx <= '0;
+                                if (loop_ky < reg_kernel_size - 1) begin
+                                    loop_ky <= loop_ky + 1;
                                 end else begin
-                                    compute_done <= 1'b1;
+                                    loop_ky <= '0;
+                                    if (loop_cin + 1 < reg_channels_in) begin
+                                        loop_cin <= loop_cin + 1;
+                                        load_full_lb <= 1'b1;
+                                    end else begin
+                                        loop_cin <= '0;
+                                    end
                                 end
                             end
                         end
                     end
                 end
-            end
+                
+                POST_PROC: begin
+                    stream_cnt <= stream_cnt + 1;
+                    if (stream_cnt == out_width - 1) begin
+                        stream_cnt <= '0;
+                        if (loop_y < reg_ifm_height - reg_kernel_size) begin
+                            loop_y <= loop_y + 1;
+                            load_full_lb <= 1'b0;
+                        end else begin
+                            loop_y <= '0;
+                            if (loop_cout + 1 < (reg_channels_out >> 4)) begin
+                                loop_cout <= loop_cout + 1;
+                                load_full_lb <= 1'b1;
+                            end
+                        end
+                    end
+                end
+            endcase
         end
     end
 
-    // Im2Col Address Calculation using pre-computed strides
-    // -------------------------------------------------------------------------
-    // Công thức tính địa chỉ 1D trên mảng SRAM từ tọa độ 3D (Y, X, C_in) theo chuẩn NHWC:
-    // Tọa độ pixel đang xử lý: 
-    //   - Tọa độ Y: (loop_out_y + loop_ky)
-    //   - Tọa độ X: (loop_out_x + loop_kx)
-    // Để tối ưu timing (tránh dùng 3 bộ nhân 32-bit), ta dùng row_stride và col_stride.
-    // Địa chỉ = Y * row_stride + X * col_stride + C_in
-    // -------------------------------------------------------------------------
-    assign ifm_read_addr = (loop_out_y + loop_ky) * reg_row_stride + 
-                           (loop_out_x + loop_kx) * reg_col_stride + loop_cin;
+    logic done_comb;
+    logic done_d1;
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            done_d1 <= 1'b0;
+            done <= 1'b0;
+        end else begin
+            done_d1 <= done_comb;
+            done <= done_d1;
+        end
+    end
 
     always_comb begin
         next_state = state;
-        done = 1'b0;
-
+        done_comb = 1'b0;
+        
         case (state)
-            IDLE: begin
-                if (start) next_state = PRE_LOAD;
+            IDLE: if (start) next_state = LOAD_BIAS;
+            LOAD_BIAS: if (load_counter == 15) next_state = LOAD_LINE_BUFFER;
+            LOAD_LINE_BUFFER: begin
+                if (lb_load_col_cnt == reg_ifm_width - 1 && lb_load_row_cnt == rows_to_load - 1)
+                    next_state = LOAD_WEIGHT;
             end
-            PRE_LOAD: begin
-                // 16 cycles for weights + 16 cycles for biases = 32 cycles
-                if (load_counter == 31) next_state = COMPUTE; 
+            LOAD_WEIGHT: if (load_counter == 15) next_state = STREAM_ROW;
+            STREAM_ROW: if (stream_cnt == out_width - 1) next_state = WAIT_FLUSH;
+            WAIT_FLUSH: begin
+                if (psum_en_bottom[0] && psum_flush_cnt == out_width - 1) begin
+                    if (loop_kx == reg_kernel_size - 1 && loop_ky == reg_kernel_size - 1) begin
+                        if (loop_cin + 1 == reg_channels_in)
+                            next_state = WAIT_BRAM;
+                        else
+                            next_state = LOAD_LINE_BUFFER;
+                    end else begin
+                        next_state = LOAD_WEIGHT;
+                    end
+                end
             end
-            COMPUTE: begin
-                if (compute_done) next_state = POST_PROC; 
+            WAIT_BRAM: begin
+                next_state = POST_PROC;
             end
             POST_PROC: begin
-                if (psum_en_bottom[15] == 1'b0) begin // Wait for pipeline flush
-                    done = 1'b1;
-                    next_state = IDLE;
+                if (stream_cnt == out_width - 1) begin
+                    if (loop_y == reg_ifm_height - reg_kernel_size && loop_cout + 1 == (reg_channels_out >> 4)) begin
+                        next_state = IDLE;
+                        done_comb = 1'b1;
+                    end else if (loop_y == reg_ifm_height - reg_kernel_size)
+                        next_state = LOAD_BIAS;
+                    else
+                        next_state = LOAD_LINE_BUFFER;
                 end
             end
         endcase
     end
 
-    // wb_read_addr mapped to load_counter
-    assign wb_read_addr = load_counter;
-    assign wb_re = (state == PRE_LOAD);
-
-    // Connect 128-bit read data directly to the 16 columns
-    assign weight_in_top = wb_read_data;
-
-    assign ifm_re = (state == COMPUTE);
-    assign data_en_left = {16{ifm_re}}; // Enable all rows during compute
-
-    // psum_en_top and psum_in_top assignment
-    assign psum_en_top = {16{ifm_re}}; // Active during compute
-    assign psum_in_top = '0;           // Bias is added at post-processing, so top is 0
-
     // =========================================================================
-    // 3. Systolic Array Core Instantiation
+    // 3. Line Buffer & IFM SRAM Interface
     // =========================================================================
-    pea_systolic_16x16 u_systolic_core (
-        .clk             (clk),
-        .rst_n           (rst_n),
-        .load_weight_en  (load_weight_en),
-        .weight_in_top   (weight_in_top),
-        .data_en_left    (data_en_left),
-        .data_in_left    (ifm_read_data),
-        .psum_en_top     (psum_en_top),
-        .psum_in_top     (psum_in_top),
-        .psum_out_bottom (psum_out_bottom),
-        .psum_en_bottom  (psum_en_bottom)
+    logic [31:0] current_load_abs_row;
+    assign current_load_abs_row = load_full_lb ? (loop_y + lb_load_row_cnt) : (loop_y + reg_kernel_size - 1);
+    
+    assign ifm_re = (state == LOAD_LINE_BUFFER);
+    assign ifm_read_addr = current_load_abs_row * reg_row_stride + lb_load_col_cnt * reg_col_stride + loop_cin;
+    
+    // 1-cycle latency for IFM SRAM
+    logic lb_we;
+    logic [31:0] lb_write_row, lb_write_col;
+    logic [31:0] lb_read_row, lb_read_col;
+    logic [127:0] lb_read_data;
+    
+    always_ff @(posedge clk) begin
+        lb_we <= ifm_re;
+        lb_write_row <= current_load_abs_row;
+        lb_write_col <= lb_load_col_cnt;
+    end
+
+    assign lb_read_row = loop_y + loop_ky;
+    assign lb_read_col = stream_cnt + loop_kx;
+    
+    line_buffer #(
+        .MAX_WIDTH(32),
+        .MAX_ROWS(5),
+        .DATA_WIDTH(128)
+    ) u_line_buffer (
+        .clk(clk),
+        .we(lb_we),
+        .write_row(lb_write_row),
+        .write_col(lb_write_col),
+        .write_data(ifm_read_data),
+        .read_row(lb_read_row),
+        .read_col(lb_read_col),
+        .read_data(lb_read_data)
     );
 
     // =========================================================================
-    // 4. Post-Processing Unit (With Right Shift Quantization)
+    // 4. Memory Interfaces & Systolic Signals
     // =========================================================================
-    logic [15:0][31:0] post_psum;
-    logic [15:0]       post_valid;
+    assign wb_re = (state == LOAD_BIAS) || (state == LOAD_WEIGHT);
+    assign wb_read_addr = (state == LOAD_BIAS) ? (reg_bias_base + loop_cout * 16 + load_counter) :
+                                                 (reg_weight_base + (tile_index * 16) + (15 - load_counter));
+
+    // 1-cycle latency for WB SRAM
+    always_ff @(posedge clk) begin
+        load_weight_en <= (state == LOAD_WEIGHT) ? 16'hFFFF : 16'd0;
+    end
     
-    genvar i;
-    generate
-        for (i = 0; i < 16; i++) begin : bias_add
-            always_ff @(posedge clk or negedge rst_n) begin
-                if (!rst_n) begin
-                    post_psum[i] <= 32'd0;
-                    post_valid[i] <= 1'b0;
-                end else begin
-                    post_valid[i] <= psum_en_bottom[i];
-                    if (psum_en_bottom[i]) begin
-                        post_psum[i] <= $signed(psum_out_bottom[i]) + $signed(bias_array[i]);
-                    end
-                end
-            end
-        end
-    endgenerate
-
-    logic [15:0][7:0] final_ofm;
-    logic [15:0]      final_valid;
-    logic signed [31:0] shifted_val [0:15];
-
-    generate
-        for (i = 0; i < 16; i++) begin : relu_quantize
-            // Arithmetic Right Shift with Rounding
-            assign shifted_val[i] = ($signed(post_psum[i]) + (32'sd1 <<< (reg_right_shift - 1))) >>> reg_right_shift;
-
-            always_ff @(posedge clk or negedge rst_n) begin
-                if (!rst_n) begin
-                    final_ofm[i] <= 8'd0;
-                    final_valid[i] <= 1'b0;
-                end else begin
-                    final_valid[i] <= post_valid[i];
-                    if (post_valid[i]) begin
-                        // ReLU Activation
-                        if ($signed(shifted_val[i]) < 0) begin
-                            final_ofm[i] <= 8'd0;
-                        end else begin
-                            // Saturation Clamp to 127 for signed INT8 max
-                            if (shifted_val[i] > 127) begin
-                                final_ofm[i] <= 8'd127; 
-                            end else begin
-                                final_ofm[i] <= shifted_val[i][7:0];
-                            end
-                        end
-                    end
-                end
-            end
-            assign ofm_write_data[i] = final_ofm[i];
-        end
-    endgenerate
-
-    assign ofm_we = |final_valid; 
+    // Delayed states for bias load
+    logic [3:0] state_delayed;
+    logic [31:0] load_counter_delayed;
+    always_ff @(posedge clk) begin
+        state_delayed <= state;
+        load_counter_delayed <= load_counter;
+    end
     
-    // ofm_write_addr generation
-    logic [ADDR_WIDTH-1:0] out_pixel_counter;
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            out_pixel_counter <= '0;
-        end else if (state == IDLE) begin
-            out_pixel_counter <= '0;
-        end else if (ofm_we) begin
-            out_pixel_counter <= out_pixel_counter + 1;
+    always_ff @(posedge clk) begin
+        if (state_delayed == LOAD_BIAS) begin
+            bias_array[load_counter_delayed] <= {wb_read_data[3], wb_read_data[2], wb_read_data[1], wb_read_data[0]};
         end
     end
-    assign ofm_write_addr = out_pixel_counter;
+    
+    // Line buffer has 1-cycle latency internally, so delay data_en_left
+    logic data_en_delayed;
+    logic psum_en_top_delayed;
+    logic swap_weight_delayed;
+    
+    always_ff @(posedge clk) begin
+        data_en_delayed <= (state == STREAM_ROW);
+        psum_en_top_delayed <= (state == STREAM_ROW);
+        swap_weight_delayed <= (state == STREAM_ROW && stream_cnt == 0);
+    end
+
+    assign data_en_left = data_en_delayed ? 16'hFFFF : 16'd0;
+    assign psum_en_top = psum_en_top_delayed ? 16'hFFFF : 16'd0;
+    assign swap_weight_in_global = swap_weight_delayed;
+    assign psum_in_top = '0; 
+
+    // =========================================================================
+    // 5. Systolic Array Core Instantiation
+    // =========================================================================
+    pea_systolic_16x16 u_systolic_core (
+        .clk                   (clk),
+        .rst_n                 (rst_n),
+        .load_weight_en        (load_weight_en),
+        .weight_in_top         (wb_read_data),
+        .swap_weight_in_global (swap_weight_in_global),
+        .data_en_left          (data_en_left),
+        .data_in_left          (lb_read_data),
+        .psum_en_top           (psum_en_top),
+        .psum_in_top           (psum_in_top),
+        .psum_out_bottom       (psum_out_bottom),
+        .psum_en_bottom        (psum_en_bottom)
+    );
+
+    // =========================================================================
+    // 6. Psum Buffer (Block RAM)
+    // =========================================================================
+    logic [511:0] psum_bram [0:63]; 
+    logic [511:0] psum_bram_dout;
+    logic [5:0]   psum_read_addr;
+    logic [5:0]   psum_write_addr;
+    logic         psum_we;
+    logic [511:0] psum_din;
+    
+    always_comb begin
+        if (state == WAIT_FLUSH && psum_en_bottom[0])
+            psum_read_addr = psum_flush_cnt;
+        else if (state == POST_PROC)
+            psum_read_addr = stream_cnt;
+        else
+            psum_read_addr = '0;
+    end
+
+    always_ff @(posedge clk) begin
+        if (psum_we) psum_bram[psum_write_addr] <= psum_din;
+        
+        if (psum_we && psum_write_addr == psum_read_addr)
+            psum_bram_dout <= psum_din;
+        else
+            psum_bram_dout <= psum_bram[psum_read_addr];
+    end
+
+    logic [15:0][31:0] psum_out_delayed;
+    logic              psum_en_delayed;
+    logic [5:0]        psum_write_addr_reg;
+    logic              is_first_acc_delayed;
+
+    always_ff @(posedge clk) begin
+        psum_out_delayed <= psum_out_bottom;
+        psum_en_delayed  <= psum_en_bottom[0] && (state == WAIT_FLUSH);
+        psum_write_addr_reg <= psum_flush_cnt; 
+        is_first_acc_delayed <= is_first_acc; // FIX: Delay is_first_acc to match BRAM write cycle
+    end
+
+    always_comb begin
+        psum_we = psum_en_delayed;
+        psum_write_addr = psum_write_addr_reg;
+        for (int i=0; i<16; i++) begin
+            if (is_first_acc_delayed) 
+                psum_din[i*32 +: 32] = psum_out_delayed[i];
+            else 
+                psum_din[i*32 +: 32] = psum_out_delayed[i] + psum_bram_dout[i*32 +: 32];
+        end
+    end
+
+    // BRAM write logic moved to the combined block above
+
+    // =========================================================================
+    // 7. Post-Processing Unit (Apply Bias, Right Shift, ReLU)
+    // =========================================================================
+    logic               post_proc_en;
+    logic [31:0]        post_proc_x;
+    logic [15:0][7:0]   final_ofm;
+    logic               ofm_we_reg;
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            post_proc_en <= 1'b0;
+            post_proc_x <= '0;
+        end else begin
+            post_proc_en <= (state == POST_PROC);
+            post_proc_x <= stream_cnt; 
+        end
+    end
+    
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            ofm_we_reg <= 1'b0;
+        end else begin
+            ofm_we_reg <= post_proc_en;
+            if (post_proc_en) begin
+                for (int i=0; i<16; i++) begin
+                    logic signed [31:0] val;
+                    logic signed [31:0] s_val;
+                    val = $signed(psum_bram_dout[i*32 +: 32]) + $signed(bias_array[i]);
+                    s_val = (val + (32'sd1 <<< (reg_right_shift - 1))) >>> reg_right_shift;
+                    
+                    if (s_val > 127) final_ofm[i] <= 8'd127;
+                    else if (s_val < -128) final_ofm[i] <= -8'sd128;
+                    else final_ofm[i] <= s_val[7:0];
+                end
+            end
+        end
+    end
+    
+    logic [31:0] post_proc_x_delayed;
+    logic [31:0] loop_y_delayed;
+    logic [31:0] loop_cout_delayed;
+    
+    always_ff @(posedge clk) begin
+        post_proc_x_delayed <= post_proc_x;
+        loop_y_delayed <= loop_y;
+        loop_cout_delayed <= loop_cout;
+    end
+    
+    ofm_post_processor #(
+        .DATA_WIDTH(8),
+        .ADDR_WIDTH(16)
+    ) u_post_processor (
+        .clk(clk),
+        .rst_n(rst_n),
+        .reg_relu_en(reg_relu_en),
+        .reg_pool_en(reg_pool_en),
+        .reg_out_width(out_width),
+        .reg_channels_out(reg_channels_out),
+        .pea_we(ofm_we_reg),
+        .pea_x(post_proc_x_delayed),
+        .pea_y(loop_y_delayed),
+        .pea_cout(loop_cout_delayed),
+        .pea_data(final_ofm),
+        .sram_we(ofm_we),
+        .sram_addr(ofm_write_addr),
+        .sram_data(ofm_write_data)
+    );
 
 endmodule

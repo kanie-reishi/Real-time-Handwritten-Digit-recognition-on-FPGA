@@ -3,6 +3,7 @@
 module global_arbiter #(
     parameter AXI_AWIDTH  = 40, 
     parameter AXI_DWIDTH  = 64,
+    parameter SRAM_DWIDTH = 128,
     // [GIẢNG BÀI] Tối ưu hóa: Thu nhỏ Address Width xuống 11-bit (16KB)
     parameter SRAM_AWIDTH = 11 
 )(
@@ -79,19 +80,19 @@ module global_arbiter #(
     // --- Tới Weight & Bias Bank ---
     output logic                    wgt_we_o,
     output logic [SRAM_AWIDTH-1:0]  wgt_addr_o,
-    output logic [AXI_DWIDTH-1:0]   wgt_wdata_o,
+    output logic [SRAM_DWIDTH-1:0]  wgt_wdata_o,
 
     // --- Tới Ping Bank (IFM/OFM) ---
     output logic                    ping_we_o,
     output logic [SRAM_AWIDTH-1:0]  ping_addr_o,
-    output logic [AXI_DWIDTH-1:0]   ping_wdata_o,
-    input  logic [AXI_DWIDTH-1:0]   ping_rdata_i,
+    output logic [SRAM_DWIDTH-1:0]  ping_wdata_o,
+    input  logic [SRAM_DWIDTH-1:0]  ping_rdata_i,
 
     // --- Tới Pong Bank (IFM/OFM) ---
     output logic                    pong_we_o,
     output logic [SRAM_AWIDTH-1:0]  pong_addr_o,
-    output logic [AXI_DWIDTH-1:0]   pong_wdata_o,
-    input  logic [AXI_DWIDTH-1:0]   pong_rdata_i
+    output logic [SRAM_DWIDTH-1:0]  pong_wdata_o,
+    input  logic [SRAM_DWIDTH-1:0]  pong_rdata_i
 );
 
     // =========================================================
@@ -143,12 +144,16 @@ module global_arbiter #(
     // =========================================================
     logic                   dma_internal_we;
     logic [SRAM_AWIDTH-1:0] dma_internal_addr;
-    logic [AXI_DWIDTH-1:0]  dma_internal_wdata;
-    logic [AXI_DWIDTH-1:0]  dma_internal_rdata;
+    logic [SRAM_DWIDTH-1:0] dma_internal_wdata;
+    logic [SRAM_DWIDTH-1:0] dma_internal_rdata;
     logic [1:0]             dma_internal_bank_sel;
 
     // Tái sử dụng module DMA FSM chúng ta đã viết ở bước trước
-    axi_full_dma_engine u_dma_engine (
+    axi_full_dma_engine #(
+        .AXI_AWIDTH(AXI_AWIDTH),
+        .AXI_DWIDTH(AXI_DWIDTH),
+        .SRAM_AWIDTH(SRAM_AWIDTH)
+    ) u_dma_engine (
         .clk            (clk),
         .rst_n          (rst_n),
         
